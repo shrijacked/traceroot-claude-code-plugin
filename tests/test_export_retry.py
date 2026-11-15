@@ -196,6 +196,30 @@ def test_overlapping_stops_export_the_ask_once(tmp_path, monkeypatch):
     assert state.load_state("sess").emitted_ask_keys == ["2026-06-22T00:00:00Z"]
 
 
+def test_a_slow_upload_is_not_sent_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+    monkeypatch.setattr(emit, "_resolve_git", lambda payload, st: ("o/r", "abc"))
+    exporter = InMemorySpanExporter()
+    tpath = _transcript(tmp_path)
+    release = threading.Event()
+    calls = []
+
+    def slow_flush():
+        calls.append(1)
+        release.wait(30)
+        return True
+
+    monkeypatch.setattr(emit, "_tracer", _tracer_for(exporter, slow_flush))
+    payload = _payload(tpath)
+    emit.handle_stop(payload)
+    emit.handle_stop(payload)
+    release.set()
+
+    assert calls == [1]
+    assert state.load_state("sess").emitted_ask_keys == ["2026-06-22T00:00:00Z"]
+
+
 def test_export_failure_result_is_recognized():
     class Failure:
         name = "FAILURE"

@@ -14,6 +14,9 @@ Design constraints:
   key. The transcript is re-parsed each Stop so a split read never loses a
   turn. Keys are recorded only after the export succeeds, so a failed export
   is retried. A crash after a successful export can send the ask again.
+  One flush covers every ask in the Stop. If a later batch in that flush
+  fails, the asks are rebuilt, so a batch the server already accepted is
+  sent again with new trace ids.
 
 Ask grouping:
   A "task-notification" turn is one whose user text starts with <task-notification>.
@@ -145,9 +148,11 @@ def _resolve_git(payload, st):
 def _capped_flush(flush) -> bool:
     """Run flush() on a daemon thread, joining with a 5s cap.
 
-    False from flush, an exception, or a thread still running at the cap means
-    the export is not known to have succeeded. None and True do: the tests'
-    fakes return None.
+    False from flush, or an exception, is a failed export and is retried.
+    A thread still running at the cap is treated as sent. The SDK's HTTP
+    timeout is longer than this cap, so the server may already be storing
+    the batch, and retrying it writes a second trace. None and True do:
+    the tests' fakes return None.
     """
     outcome = {"ok": True}
 
@@ -164,7 +169,9 @@ def _capped_flush(flush) -> bool:
     th.start()
     th.join(5.0)
     if th.is_alive():
-        return False
+        # Still uploading at the cap: the server may already have it.
+        # Retrying here duplicates traces.
+        return True
     return outcome["ok"]
 
 
