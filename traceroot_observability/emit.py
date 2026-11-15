@@ -12,8 +12,11 @@ Design constraints:
 - Fail-open: missing api_key, session_id, or transcript_path → return quietly.
 - emitted_ask_keys tracks which asks have been exported, by stable timestamp
   key. The transcript is re-parsed each Stop so a split read never loses a
-  turn. Keys are recorded only after the export succeeds, so a failed export
-  is retried. A crash after a successful export can send the ask again.
+  turn. Keys are recorded after the export succeeds. A flush still running
+  at the 5s cap is recorded too, without waiting for that upload to return,
+  because the server may already have the batch. A flush that returns false
+  or raises is retried. A crash after a successful export can send the ask
+  again.
   One flush covers every ask in the Stop. If a later batch in that flush
   fails, the asks are rebuilt, so a batch the server already accepted is
   sent again with new trace ids.
