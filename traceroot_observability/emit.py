@@ -83,7 +83,12 @@ def _flush_client(traceroot) -> bool:
     failed = {"value": False}
 
     def watching(spans):
-        result = original(spans)
+        try:
+            result = original(spans)
+        except Exception:
+            # The batch worker catches this and force_flush still returns True.
+            failed["value"] = True
+            raise
         if _export_result_failed(result):
             failed["value"] = True
         return result
@@ -287,42 +292,42 @@ def handle_stop(payload: dict, is_session_end: bool = False) -> None:
         if not newly_emitted_keys:
             _state.save_state(session_id, st)
 
-    debug_log(
-        f"Stop: {len(records)} records total, {len(turns)} complete turns,"
-        f" {len(asks)} asks, {len(to_emit)} new complete asks, session={session_id}"
-    )
+        # The lock stays held through the flush. Releasing it first let a
+        # second Stop select the same asks and export them twice.
+        debug_log(
+            f"Stop: {len(records)} records total, {len(turns)} complete turns,"
+            f" {len(asks)} asks, {len(to_emit)} new complete asks, session={session_id}"
+        )
 
-    if not to_emit:
-        return
+        if not to_emit:
+            return
 
-    try:
-        tracer, flush = _tracer(cfg, git)
+        try:
+            tracer, flush = _tracer(cfg, git)
 
-        from .subagents import make_emitter
-        emitter = make_emitter(session_id, tpath)
+            from .subagents import make_emitter
+            emitter = make_emitter(session_id, tpath)
 
-        for ask_turns in to_emit:
-            _s.build_ask_spans(
-                tracer,
-                ask_turns,
-                session_id,
-                git,
-                ["claude-code"],
-                cfg.max_chars,
-                subagent_emitter=emitter,
-            )
+            for ask_turns in to_emit:
+                _s.build_ask_spans(
+                    tracer,
+                    ask_turns,
+                    session_id,
+                    git,
+                    ["claude-code"],
+                    cfg.max_chars,
+                    subagent_emitter=emitter,
+                )
 
-        exported = _capped_flush(flush)
-    except Exception:
-        _note_export_failure(session_id)
-        return
+            exported = _capped_flush(flush)
+        except Exception:
+            _note_export_failure(session_id)
+            return
 
-    if not exported:
-        _note_export_failure(session_id)
-        return
+        if not exported:
+            _note_export_failure(session_id)
+            return
 
-    with _state.session_lock(session_id):
-        st = _state.load_state(session_id)
         st.emitted_ask_keys = sorted(set(st.emitted_ask_keys) | set(newly_emitted_keys))
         repo, ref = git
         if repo:

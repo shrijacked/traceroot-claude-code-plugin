@@ -1,4 +1,5 @@
 import json
+import threading
 
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -88,6 +89,111 @@ def test_a_tracer_that_raises_leaves_the_ask_unrecorded(tmp_path, monkeypatch):
     emit.handle_stop(_payload(_transcript(tmp_path)))
 
     assert state.load_state("sess").emitted_ask_keys == []
+
+
+class _Result:
+    def __init__(self, name):
+        self.name = name
+
+
+class _Exporter:
+    def __init__(self, export):
+        self.export = export
+
+
+class _Processor:
+    """Stand in for BatchSpanProcessor: a raised export still flushes as success."""
+
+    def __init__(self, exporter):
+        self.span_exporter = exporter
+
+    def force_flush(self):
+        try:
+            self.span_exporter.export([])
+        except Exception:
+            return True
+        return True
+
+
+class _Client:
+    def __init__(self, processor):
+        self.span_processor = processor
+
+
+class _Root:
+    def __init__(self, client):
+        self._client = client
+
+    def get_client(self):
+        return self._client
+
+    def shutdown(self):
+        return None
+
+
+def _root(export):
+    return _Root(_Client(_Processor(_Exporter(export))))
+
+
+def test_a_failure_result_makes_flush_false():
+    root = _root(lambda spans: _Result("FAILURE"))
+    assert emit._flush_client(root) is False
+
+
+def test_a_raising_export_makes_flush_false():
+    def boom(spans):
+        raise RuntimeError("export down")
+
+    assert emit._flush_client(_root(boom)) is False
+
+
+def test_a_raising_export_leaves_the_ask_unrecorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+    monkeypatch.setattr(emit, "_resolve_git", lambda payload, st: ("o/r", "abc"))
+
+    def boom(spans):
+        raise RuntimeError("export down")
+
+    root = _root(boom)
+    exporter = InMemorySpanExporter()
+    monkeypatch.setattr(emit, "_tracer", _tracer_for(exporter, lambda: emit._flush_client(root)))
+
+    emit.handle_stop(_payload(_transcript(tmp_path)))
+
+    assert state.load_state("sess").emitted_ask_keys == []
+
+
+def test_overlapping_stops_export_the_ask_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+    monkeypatch.setattr(emit, "_resolve_git", lambda payload, st: ("o/r", "abc"))
+    exporter = InMemorySpanExporter()
+    tpath = _transcript(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def slow_flush():
+        calls.append(1)
+        started.set()
+        assert release.wait(3)
+        return True
+
+    monkeypatch.setattr(emit, "_tracer", _tracer_for(exporter, slow_flush))
+    payload = _payload(tpath)
+    first = threading.Thread(target=lambda: emit.handle_stop(payload))
+    first.start()
+    assert started.wait(3)
+    second = threading.Thread(target=lambda: emit.handle_stop(payload))
+    second.start()
+    second.join(0.2)
+    release.set()
+    first.join(3)
+    second.join(3)
+
+    assert calls == [1]
+    assert state.load_state("sess").emitted_ask_keys == ["2026-06-22T00:00:00Z"]
 
 
 def test_export_failure_result_is_recognized():
