@@ -77,6 +77,85 @@ def test_the_next_stop_sends_an_ask_whose_export_failed(tmp_path, monkeypatch):
     assert len(exporter.get_finished_spans()) > failed_spans
 
 
+def _two_asks(tmp_path):
+    """One ask the span builder cannot parse, then one it can."""
+    rows = []
+    for ts, text, usage in (
+        ("2026-06-22T00:00:00Z", "bad", {"input_tokens": 1, "output_tokens": "unknown"}),
+        ("2026-06-22T00:01:00Z", "good", {"input_tokens": 2, "output_tokens": 3}),
+    ):
+        rows.append(json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": text},
+            "timestamp": ts,
+        }))
+        rows.append(json.dumps({
+            "type": "assistant",
+            "requestId": ts,
+            "timestamp": ts.replace("00Z", "01Z"),
+            "message": {
+                "id": ts,
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": text}],
+                "usage": usage,
+            },
+        }))
+    tpath = tmp_path / "sess.jsonl"
+    tpath.write_text("\n".join(rows) + "\n")
+    return tpath
+
+
+def test_a_build_error_does_not_block_later_asks(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+    monkeypatch.setattr(emit, "_resolve_git", lambda payload, st: ("o/r", "abc"))
+    exporter = InMemorySpanExporter()
+    tpath = _two_asks(tmp_path)
+    flushes = []
+
+    def flush():
+        flushes.append(1)
+        return True
+
+    monkeypatch.setattr(emit, "_tracer", _tracer_for(exporter, flush))
+    payload = _payload(tpath)
+    emit.handle_stop(payload)
+    after_first = list(state.load_state("sess").emitted_ask_keys)
+    spans_after_first = len(exporter.get_finished_spans())
+
+    emit.handle_stop(payload)
+
+    assert after_first == ["2026-06-22T00:00:00Z", "2026-06-22T00:01:00Z"]
+    assert spans_after_first > 0
+    assert flushes == [1]
+    assert state.load_state("sess").emitted_ask_keys == after_first
+
+
+def test_a_build_error_still_retries_the_ask_whose_upload_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+    monkeypatch.setattr(emit, "_resolve_git", lambda payload, st: ("o/r", "abc"))
+    exporter = InMemorySpanExporter()
+    tpath = _two_asks(tmp_path)
+    flushes = []
+
+    def flush():
+        flushes.append(1)
+        return len(flushes) > 1
+
+    monkeypatch.setattr(emit, "_tracer", _tracer_for(exporter, flush))
+    payload = _payload(tpath)
+    emit.handle_stop(payload)
+    assert state.load_state("sess").emitted_ask_keys == ["2026-06-22T00:00:00Z"]
+
+    emit.handle_stop(payload)
+    assert flushes == [1, 1]
+    assert state.load_state("sess").emitted_ask_keys == [
+        "2026-06-22T00:00:00Z",
+        "2026-06-22T00:01:00Z",
+    ]
+
+
 def test_a_tracer_that_raises_leaves_the_ask_unrecorded(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
     monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
