@@ -156,6 +156,88 @@ def test_a_build_error_still_retries_the_ask_whose_upload_failed(tmp_path, monke
     ]
 
 
+def _multi_turn_bad_usage(tmp_path):
+    """A human turn, then a task-notification whose token count cannot be parsed."""
+    notif = "<task-notification>\n<task-id>t1</task-id>\n</task-notification>"
+    rows = [
+        json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": "hi"},
+            "timestamp": "2026-06-22T00:00:00Z",
+        }),
+        json.dumps({
+            "type": "assistant",
+            "requestId": "r1",
+            "timestamp": "2026-06-22T00:00:01Z",
+            "message": {
+                "id": "r1",
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "hello"}],
+                "usage": {"input_tokens": 5, "output_tokens": 9},
+            },
+        }),
+        json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": notif},
+            "timestamp": "2026-06-22T00:00:02Z",
+        }),
+        json.dumps({
+            "type": "assistant",
+            "requestId": "r2",
+            "timestamp": "2026-06-22T00:00:03Z",
+            "message": {
+                "id": "r2",
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {"input_tokens": 1, "output_tokens": "unknown"},
+            },
+        }),
+    ]
+    tpath = tmp_path / "sess.jsonl"
+    tpath.write_text("\n".join(rows) + "\n")
+    return tpath
+
+
+def test_a_later_turn_with_bad_usage_exports_no_spans(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+    monkeypatch.setattr(emit, "_resolve_git", lambda payload, st: ("o/r", "abc"))
+    exporter = InMemorySpanExporter()
+    tpath = _multi_turn_bad_usage(tmp_path)
+    monkeypatch.setattr(emit, "_tracer", _tracer_for(exporter, lambda: True))
+
+    emit.handle_stop(_payload(tpath))
+
+    assert exporter.get_finished_spans() == ()
+    assert state.load_state("sess").emitted_ask_keys == ["2026-06-22T00:00:00Z"]
+
+
+def test_an_unexpected_build_error_is_retried(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+    monkeypatch.setattr(emit, "_resolve_git", lambda payload, st: ("o/r", "abc"))
+    exporter = InMemorySpanExporter()
+    tpath = _transcript(tmp_path)
+    calls = []
+    real = emit._s.build_ask_spans
+
+    def build(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("plugin bug")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(emit._s, "build_ask_spans", build)
+    monkeypatch.setattr(emit, "_tracer", _tracer_for(exporter, lambda: True))
+    payload = _payload(tpath)
+    emit.handle_stop(payload)
+    assert state.load_state("sess").emitted_ask_keys == []
+
+    emit.handle_stop(payload)
+    assert state.load_state("sess").emitted_ask_keys == ["2026-06-22T00:00:00Z"]
+    assert len(exporter.get_finished_spans()) > 0
+
+
 def test_a_tracer_that_raises_leaves_the_ask_unrecorded(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "STATE_ROOT", tmp_path)
     monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")

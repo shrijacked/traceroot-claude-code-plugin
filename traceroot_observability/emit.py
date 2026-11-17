@@ -15,10 +15,10 @@ Design constraints:
   turn. Keys are recorded after the export succeeds. A flush still running
   at the 5s cap is recorded too, without waiting for that upload to return,
   because the server may already have the batch. A flush that returns false
-  or raises is retried. An ask whose spans cannot be built is recorded
-  without uploading, so that row is not rebuilt on the next Stop and the
-  other asks in the session can still be sent. A crash after a successful
-  export can send the ask again.
+  or raises is retried. An ask whose token counts cannot be parsed is
+  recorded, and no spans from it are exported. Any other error while
+  building that ask is left unrecorded, so the next Stop can retry it.
+  A crash after a successful export can send the ask again.
   One flush covers every ask in the Stop. If a later batch in that flush
   fails, the asks are rebuilt, so a batch the server already accepted is
   sent again with new trace ids.
@@ -337,11 +337,23 @@ def handle_stop(payload: dict, is_session_end: bool = False) -> None:
                     cfg.max_chars,
                     subagent_emitter=emitter,
                 )
-            except Exception:
-                # The transcript will still say this on the next Stop. Leaving
-                # the key out retries it forever and blocks every ask after it.
-                debug_log(f"Stop: skip ask {key}; span build failed, session={session_id}")
+            except (ValueError, TypeError):
+                # A token count that is not a number will still be wrong on
+                # the next Stop. Record the ask so it does not block the rest.
+                debug_log(f"Stop: skip ask {key}; token usage cannot be parsed, session={session_id}")
                 unbuildable.append(key)
+                continue
+            except Exception:
+                # A plugin bug can be fixed. Leave the key out so a later Stop
+                # rebuilds the ask.
+                debug_log(f"Stop: ask {key} will be retried; span build failed, session={session_id}")
+                try:
+                    print(
+                        "traceroot: span build failed; this turn will be tried again on the next Stop",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
                 continue
             built_keys.append(key)
 
