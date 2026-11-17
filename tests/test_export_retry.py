@@ -343,16 +343,27 @@ def test_overlapping_stops_export_the_ask_once(tmp_path, monkeypatch):
 
     monkeypatch.setattr(emit, "_tracer", _tracer_for(exporter, slow_flush))
     payload = _payload(tpath)
-    first = threading.Thread(target=lambda: emit.handle_stop(payload))
+    errors = []
+
+    def run():
+        try:
+            emit.handle_stop(payload)
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=run)
     first.start()
     assert started.wait(3)
-    second = threading.Thread(target=lambda: emit.handle_stop(payload))
+    second = threading.Thread(target=run)
     second.start()
     second.join(0.2)
     release.set()
     first.join(3)
     second.join(3)
 
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
     assert calls == [1]
     assert state.load_state("sess").emitted_ask_keys == ["2026-06-22T00:00:00Z"]
 
